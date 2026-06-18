@@ -9,6 +9,7 @@ from enum import Enum, unique
 from json import dumps
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 from uuid import uuid4
+from ast import literal_eval
 
 import aiohttp
 
@@ -44,6 +45,7 @@ LR4_STATUS_MAP = {
     "ROBOT_BONNET": LitterBoxStatus.BONNET_REMOVED,
     "ROBOT_CAT_DETECT": LitterBoxStatus.CAT_DETECTED,
     "ROBOT_CAT_DETECT_DELAY": LitterBoxStatus.CAT_SENSOR_TIMING,
+    "ROBOT_CAT_DETECT_INTERRUPTED": LitterBoxStatus.CAT_SENSOR_INTERRUPTED,
     "ROBOT_CLEAN": LitterBoxStatus.CLEAN_CYCLE,
     "ROBOT_EMPTY": LitterBoxStatus.EMPTY_CYCLE,
     "ROBOT_FIND_DUMP": LitterBoxStatus.CLEAN_CYCLE,
@@ -71,6 +73,47 @@ CYCLE_STATE_STATUS_MAP = {
 }
 DISPLAY_CODE_STATUS_MAP = {"DC_CAT_DETECT": LitterBoxStatus.CAT_DETECTED}
 
+LR4_ACTIVITY_STATUS_MAP={
+    "powerStatusOn": "ROBOT_POWER_UP",
+    "powerStatusOff": "ROBOT_POWER_OFF",
+    #"catDetectScaleSet": LitterBoxStatus.CAT_DETECTED,
+    #"catDetectLaserSet": LitterBoxStatus.CAT_DETECTED,
+    "catDetectResetPaused": "ROBOT_CAT_DETECT_INTERRUPTED",
+    "robotStatusCatDetect": "ROBOT_CAT_DETECT",
+    "robotStatusCatDetectDelay": "ROBOT_CAT_DETECT_DELAY",
+    "robotStatusClean": "ROBOT_CLEAN",
+    "robotCycleStatusDump": "ROBOT_FIND_DUMP",
+    "robotCycleStatusDFI": "ROBOT_FIND_DUMP",
+    "robotCycleStatusLevel": "ROBOT_CLEAN",
+    "robotCycleStatusHome": "ROBOT_CLEAN",
+    "robotCycleStatusIdle": "ROBOT_IDLE",
+    "bonnetRemovedYes": "ROBOT_BONNET",
+}
+LR4_ACTIVITY_DATA_MAP={
+    "odometerCleanCycles": "odometerCleanCycles",
+    "DFILevelPercent": "DFILevelPercent",
+    "catWeight": "catWeight",
+    "litterLevel": "litterLevel",
+}
+LR4_ACTIVITY_CYCLE_MAP={
+    "robotCycleStateCatDetect": "CYCLE_STATE_CAT_DETECT",
+    "robotCycleStatePause": "CYCLE_STATE_PAUSE",
+    "robotCycleStatusAbort": "CYCLE_STATE_PAUSE",
+}
+LR4_ACTIVITY_FAULT_MAP={
+    "globeMotorFaultStatusFaultPinch": GlobeMotorFaultStatus.FAULT_PINCH,
+    "globeMotorFaultStatusFaultClear": GlobeMotorFaultStatus.FAULT_CLEAR,
+}
+LR4_ACTIVITY_BOOLEAN_MAP={
+    "DFIFullFlagOn": {"isDFIFull": True},
+    "litterHopperEnabled": {"hopperStatus": "ENABLED"},
+    "litterHopperDisabled": {"hopperStatus": "DISABLED"},
+}
+LR4_ACTIVITY_TRIGGER_MAP={
+    "catDetectLaserSet": "laser",
+    "catDetectScaleSet": "scale",
+    "litterHopperDispensed": "litter_dispensed",
+}
 LITTER_LEVEL_EMPTY = 500
 
 
@@ -168,6 +211,9 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
     _previous_sleep_data: dict[str, dict] | None
 
     _ws_subscription_id: str | None = None
+    _ws_subscription_activity_id: str | None = None
+
+    _subscribers = { "laser": [], "scale": [], "litter_dispensed": [] }
 
     def __init__(self, data: dict, account: Account) -> None:
         """Initialize a Litter-Robot 4."""
@@ -250,6 +296,11 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
         return cast(float, self._data.get("litterLevelPercentage", 0)) * 100
 
     @property
+    def hopper_level(self) -> float:
+        """Return the hopper level."""
+        return cast(float, self._data.get("hopperLevel", None))
+
+    @property
     def litter_level_calculated(self) -> float:
         """Return the calculated litter level.
 
@@ -312,6 +363,16 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
         return cast(float, self._data.get("catWeight", 0))
 
     @property
+    def pet_weight_timestamp(self) -> float:
+        """Return the last recorded pet weight timestamp."""
+        return cast(float, self._data.get("catWeightTimestamp", None))
+
+    @property
+    def last_timestamp(self) -> float:
+        """Return the last recorded timestamp."""
+        return cast(float, self._data.get("lastTimestamp", None))
+
+    @property
     @deprecated("Use power_type instead")
     def power_status(self) -> str:
         """Return the power type.
@@ -352,6 +413,8 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
             return LitterBoxStatus.OFFLINE
         if not self.is_on:
             return LitterBoxStatus.OFF
+        if self.globe_motor_fault_status == GlobeMotorFaultStatus.FAULT_PINCH:
+            return LitterBoxStatus.PINCH_DETECT
         if status := CYCLE_STATE_STATUS_MAP.get(self._data["robotCycleState"]):
             return status
         status = LR4_STATUS_MAP.get(self._data["robotStatus"], LitterBoxStatus.UNKNOWN)
@@ -453,6 +516,30 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
             _LOGGER.error(ex)
             return False
 
+    def _trigger_subscribers(self, key):
+        if funcs := self._subscribers.get(key):
+            for func in funcs:
+                func()
+
+    def subscribe_to(self, key, funcs: list) -> Callable[[], None] | None:
+        if key not in self._subscribers:
+            return None
+        for func in funcs:
+            self._subscribers[key].append(func)
+        def unsubscribe():
+            if func in self._subscribers[key]:
+                self._subscribers[key].remove(func)
+        return unsubscribe
+
+    def subscribe_to_laser(self, funcs: list):
+        self.subscribe_to("laser", funcs)
+
+    def subscribe_to_scale(self, funcs: list):
+        self.subscribe_to("scale", funcs)
+
+    def subscribe_to_litter_dispensed(self, funcs: list):
+        self.subscribe_to("litter_dispensed", funcs)
+
     async def refresh(self) -> None:
         """Refresh the Litter-Robot's data from the API."""
         data = await self._post(
@@ -466,6 +553,11 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
             },
         )
         data = cast(dict, data)
+
+        with open("/config/testlog.txt", "a") as file:
+            file.write(str(datetime.now()) + "R: ")
+            file.write(dumps(data))
+            file.write("\n")
         self._update_data(data.get("data", {}).get("getLitterRobot4BySerial", {}))
 
     async def reset(self) -> bool:
@@ -761,13 +853,46 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
             )
         return is_success
 
-    @staticmethod
-    def parse_websocket_message(data: dict) -> list[dict] | None:
-        """Parse a websocket message."""
+    def parse_activity_websocket_data(self, data: dict) -> list[dict] | None:
+        pdata = {};
+        # Check if it's a status update
+        if data["measure"] == "fault":
+            fault = LR4_ACTIVITY_FAULT_MAP.get(data["value"], GlobeMotorFaultStatus.FAULT_UNKNOWN)
+            pdata["globeMotorFaultStatus"] = fault
+        elif status := LR4_ACTIVITY_CYCLE_MAP.get(data["value"]):
+            pdata["robotCycleState"] = status
+        elif status := LR4_ACTIVITY_STATUS_MAP.get(data["value"]):
+            pdata["robotStatus"] = status
+        elif status := LR4_ACTIVITY_BOOLEAN_MAP.get(data["value"]):
+            if isinstance(status, dict):
+                for key in status:
+                    pdata[key] = status[key]
+        elif field := LR4_ACTIVITY_DATA_MAP.get(data["value"]):
+            try:
+                pdata[field] = literal_eval(data["actionValue"])
+            except ValueError:
+                pdata[field] = data["actionValue"]
+        elif key := LR4_ACTIVITY_TRIGGER_MAP.get(data["value"]):
+            self._trigger_subscribers(key)
+        if pdata and (timestamp := data.get("timestamp")):
+            pdata["lastTimestamp"] = cast(datetime, to_timestamp(float(timestamp)/1000.0))
+            if data["value"] == "catWeight":
+                pdata["catWeightTimestamp"] = pdata["lastTimestamp"]
+        if data["value"] == "litterHopperDispensed":
+            pdata["hopperLevel"] = literal_eval(data["actionValue"])
+            #if literal_eval(data["actionValue"]) < 65:
+            #    pdata["hopperStatus"] = "EMPTY"
+            #else:
+            #    pdata["hopperStatus"] = "ENABLED"
+        return [pdata] or None
+
+    def parse_websocket_message(self, data: dict) -> list[dict] | None:
+        """Parse a wesocket message."""
         if (data_type := data["type"]) == "data":
-            states = data["payload"]["data"]["litterRobot4StateSubscriptionByUser"][
-                "robots"
-            ]
+            if "litterRobot4StateSubscriptionByUser" in data["payload"]["data"]:
+                states = data["payload"]["data"]["litterRobot4StateSubscriptionByUser"]["robots"]
+            elif "litterRobot4ActivitySubscriptionBySerial" in data["payload"]["data"]:
+                states = self.parse_activity_websocket_data(data["payload"]["data"]["litterRobot4ActivitySubscriptionBySerial"])
             return states if isinstance(states, list) else None
         if data_type == "error":
             _LOGGER.error(data)
@@ -797,6 +922,10 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
         if not isinstance(data, dict):
             return []
 
+        with open("/config/testlog.txt", "a") as file:
+            file.write(str(datetime.now()) + "F: ")
+            file.write(dumps(data))
+            file.write("\n")
         robots = data.get("getLitterRobot4ByUser")
         if isinstance(robots, list):
             return [r for r in robots if isinstance(r, dict)]
@@ -818,6 +947,7 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
     async def _ws_subscribe(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Subscribe to the WebSocket for updates."""
         self._ws_subscription_id = str(uuid4())
+        self._ws_subscription_activity_id = str(uuid4())
         auth = await self._account.get_bearer_authorization()
         await ws.send_json(
             {
@@ -845,20 +975,61 @@ class LitterRobot4(LitterRobot):  # pylint: disable=abstract-method
                 "type": "start",
             }
         )
+        await ws.send_json(
+            {
+                "id": self._ws_subscription_activity_id,
+                "payload": {
+                    "data": dumps(
+                        {
+                            "query": f"""
+                                subscription GetLR4($serial: String!) {{
+                                    litterRobot4ActivitySubscriptionBySerial(serial: $serial) {{
+                                        value
+                                        timestamp
+                                        measure
+                                        actionValue
+                                    }}
+                                }}
+                            """,
+                            "variables": {"serial": self.serial},
+                        }
+                    ),
+                    "extensions": {
+                        "authorization": {
+                            "Authorization": auth,
+                            "host": "lr4.iothings.site",
+                        }
+                    },
+                },
+                "type": "start",
+            }
+        )
 
     async def _ws_unsubscribe(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Unsubscribe from WebSocket updates."""
         if self._ws_subscription_id:
             await ws.send_json({"id": self._ws_subscription_id, "type": "stop"})
             self._ws_subscription_id = None
+        if self._ws_subscription_activity_id:
+            await ws.send_json({"id": self._ws_subscription_activity_id, "type": "stop"})
+            self._ws_subscription_activity_id = None
 
     def _ws_message_handler(self, data: dict) -> None:
         """Handle a message from the WebSocket."""
+        with open("/config/testlog.txt", "a") as file:
+            file.write(str(datetime.now()) + ": ")
+            file.write(dumps(data))
+            file.write("\n")
         parsed = self.parse_websocket_message(data)
         if isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, dict) and str(item.get(self._data_id)) == self.id:
+                    if not item.get("hopperStatus"):
+                        item.pop("hopperStatus")
                     self._update_data(item)
+                    break
+                elif isinstance(item, dict) and data.get("id") == self._ws_subscription_activity_id:
+                    self._update_data(item, partial=True)
                     break
 
     _WS_PROTOCOL: ClassVar[WebSocketProtocol] = WebSocketProtocol(
